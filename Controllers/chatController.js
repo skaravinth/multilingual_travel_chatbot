@@ -1,17 +1,22 @@
 const ChatSession = require("../models/ChatSession");
 const ChatMessage = require("../models/ChatMessage");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const axios = require("axios");
+
+const getAuthenticatedUserId = (req) => req.user?.id || req.user?.userId || null;
 /* =========================
    CREATE SESSION
 ========================= */
 exports.createSession = async (req, res) => {
   try {
     const { title, language } = req.body;
+    const userId = getAuthenticatedUserId(req);
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
     const session = await ChatSession.create({
-      userId: req.user.id || "69a5a3974ffe0edb1a717a44",
+      userId,
       title: title || "Travel Chat",
       language: language || "en",
     });
@@ -30,10 +35,22 @@ exports.createSession = async (req, res) => {
 exports.sendMessage = async (req, res) => {
   try {
     const { sessionId, message, language, latitude, longitude } = req.body;
+    const userId = getAuthenticatedUserId(req);
 
     if (!sessionId || !message) {
       return res.status(400).json({
         message: "SessionId and message are required",
+      });
+    }
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const session = await ChatSession.findOne({ _id: sessionId, userId });
+    if (!session) {
+      return res.status(404).json({
+        error: "Chat session not found for this user",
       });
     }
 
@@ -51,11 +68,18 @@ exports.sendMessage = async (req, res) => {
     const selectedLanguage =
       languageMap[language] || language || "English";
 
+    const openRouterKey = process.env.OPENROUTER_API_KEY?.trim();
+    if (!openRouterKey) {
+      return res.status(500).json({
+        error: "Server configuration error: missing OpenRouter API key",
+      });
+    }
+
     // =============================
     // 1️⃣ Save User Message
     // =============================
     await ChatMessage.create({
-      sessionId,
+      sessionId: session._id,
       sender: "user",
       message,
     });
@@ -63,7 +87,7 @@ exports.sendMessage = async (req, res) => {
     // =============================
     // 2️⃣ Get Previous Messages
     // =============================
-    const previousMessages = await ChatMessage.find({ sessionId })
+    const previousMessages = await ChatMessage.find({ sessionId: session._id })
       .sort({ createdAt: 1 })
       .limit(20);
 
@@ -124,7 +148,7 @@ Keep responses helpful, friendly, and travel-focused.
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          Authorization: `Bearer ${openRouterKey}`,
           "Content-Type": "application/json",
         },
       }
@@ -141,7 +165,7 @@ Keep responses helpful, friendly, and travel-focused.
     // 6️⃣ Save Bot Message
     // =============================
     const botMessage = await ChatMessage.create({
-      sessionId,
+      sessionId: session._id,
       sender: "bot",
       message: aiResponse,
     });
@@ -152,13 +176,20 @@ Keep responses helpful, friendly, and travel-focused.
     res.status(200).json({ botMessage });
 
   } catch (error) {
-    console.error(
-      "Chat Error:",
-      error.response?.data || error.message
-    );
+    const errorData = error.response?.data || error.message;
+    console.error("Chat Error:", errorData);
 
-    res.status(500).json({
-      error: "AI request failed",
+    const providerStatus = error.response?.status;
+    if (providerStatus === 401) {
+      return res.status(502).json({
+        error:
+          "AI provider authentication failed. Check OPENROUTER_API_KEY and OpenRouter account access.",
+        providerError: errorData,
+      });
+    }
+
+    res.status(providerStatus || 500).json({
+      error: typeof errorData === "string" ? errorData : errorData || "AI request failed",
     });
   }
 };
@@ -183,8 +214,14 @@ exports.getChatHistory = async (req, res) => {
 ========================= */
 exports.getUserSessions = async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
     const sessions = await ChatSession.find({
-      userId: req.user.id,
+      userId,
     }).sort({ createdAt: -1 });
 
     res.json(sessions);
