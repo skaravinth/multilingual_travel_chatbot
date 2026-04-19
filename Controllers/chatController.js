@@ -76,6 +76,118 @@ const detectLocationIntent = (message) => {
   };
 };
 
+const detectBudgetPreference = (message) => {
+  const normalizedMessage = String(message || "").toLowerCase();
+
+  if (/(luxury|premium|5 star|five star|high[- ]?end)/.test(normalizedMessage)) {
+    return "luxury";
+  }
+
+  if (/(budget|cheap|affordable|low cost|low-cost|backpack)/.test(normalizedMessage)) {
+    return "budget";
+  }
+
+  if (/(mid[- ]?range|moderate|comfortable)/.test(normalizedMessage)) {
+    return "mid-range";
+  }
+
+  return "";
+};
+
+const extractDestinationFromMessage = (message) => {
+  const text = String(message || "").trim();
+  if (!text) {
+    return "";
+  }
+
+  const patterns = [
+    /\b(?:in|at|near|around|for|to|visit|visiting|travel to|trip to|going to)\s+([A-Z][A-Za-z.\-]+(?:\s+[A-Z][A-Za-z.\-]+){0,3})/,
+    /\b(?:in|at|near|around|for|to|visit|visiting|travel to|trip to|going to)\s+([a-z]+(?:\s+[a-z]+){0,3})/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  }
+
+  return "";
+};
+
+const buildEnglishSmartFallback = ({
+  message,
+  hasLocation,
+  locationSummary,
+  nearbyPlaces,
+}) => {
+  const intent = detectLocationIntent(message);
+  const budgetPreference = detectBudgetPreference(message);
+  const destination = extractDestinationFromMessage(message) || locationSummary;
+  const areaText = destination || (hasLocation ? "your current area" : "your destination");
+  const placeNames = nearbyPlaces?.places?.slice(0, 3).map((place) => place.name).filter(Boolean) || [];
+  const intro = hasLocation
+    ? `I could not reach the AI provider, but I can still give you a practical travel answer for ${areaText}.`
+    : `I could not reach the AI provider, but here is a practical travel answer based on your message.`;
+
+  if (intent.label === "hotels") {
+    const budgetLine = budgetPreference
+      ? `Focus on ${budgetPreference} stays, compare recent guest ratings, and check transport access before booking.`
+      : "Compare recent guest ratings, neighborhood safety, and transport access before booking.";
+    const nearbyLine = placeNames.length
+      ? `A few nearby stay-related options or landmarks to check around ${areaText}: ${placeNames.join(", ")}.`
+      : `If you want, I can next narrow this down to the best areas to stay in ${areaText} for families, couples, or budget travel.`;
+
+    return `${intro}
+
+For hotels in ${areaText}, start with properties close to the places you plan to visit most so you save time on daily transport.
+${budgetLine}
+Prioritize free cancellation, breakfast if you have early plans, and reviews that mention cleanliness and quiet rooms.
+${nearbyLine}`;
+  }
+
+  if (intent.label === "food spots") {
+    const nearbyLine = placeNames.length
+      ? `A few nearby food spots or landmarks to start with: ${placeNames.join(", ")}.`
+      : `Start around busy local markets or central dining streets in ${areaText} for the widest range of food choices.`;
+
+    return `${intro}
+
+For food in ${areaText}, mix one well-rated local restaurant with one casual street-food or cafe stop so you get both signature dishes and easy comfort options.
+${nearbyLine}
+Check peak meal hours, keep cash or UPI/card backup ready, and choose places with strong recent reviews for hygiene and consistency.
+If you want, I can turn this into a breakfast-lunch-dinner food plan next.`;
+  }
+
+  if (intent.label === "transport options") {
+    const nearbyLine = placeNames.length
+      ? `Useful nearby transport points to look at first: ${placeNames.join(", ")}.`
+      : `Start by checking the nearest railway station, bus hub, metro stop, or airport connection for ${areaText}.`;
+
+    return `${intro}
+
+For transport around ${areaText}, the best option usually depends on distance: walking or local rides for short hops, metro or train for busy corridors, and buses or cabs for flexible point-to-point travel.
+${nearbyLine}
+Travel earlier in the day for sightseeing, keep one offline maps option ready, and confirm the return route before late evening.
+If you share your exact route, I can suggest the cheapest or fastest way to get there.`;
+  }
+
+  const nearbyLine = placeNames.length
+    ? `A few places worth checking first near ${areaText}: ${placeNames.join(", ")}.`
+    : hasLocation
+      ? `I can use your current area to shape a nearby sightseeing plan.`
+      : `If you share the destination name, I can turn this into a city-specific itinerary.`;
+
+  return `${intro}
+
+Here is a simple travel planning answer for ${areaText}:
+1. Start with 2 or 3 major sights close to each other so the day stays realistic.
+2. Add one local food stop and one relaxed evening activity.
+3. Choose transport and hotel options based on whether you want budget, comfort, or speed.
+${nearbyLine}
+Send your budget, dates, and trip style if you want a personalized one-day or multi-day plan.`;
+};
+
 const fallbackMessages = {
   en: ({ hasLocation }) =>
     `I can still help with travel planning right now. Share your destination, budget, travel dates, and interests, and I will suggest places to visit, food to try, transport options, and hotel ideas.${hasLocation ? " I noticed location data was shared, so I can tailor nearby travel ideas once you tell me what kind of trip you want." : ""}`,
@@ -157,6 +269,25 @@ const generateFallbackResponse = ({ language, hasLocation }) => {
   return fallbackBuilder({ hasLocation });
 };
 
+const generateSmartFallbackResponse = ({
+  language,
+  message,
+  hasLocation,
+  locationSummary,
+  nearbyPlaces,
+}) => {
+  if (language === "en" || !language) {
+    return buildEnglishSmartFallback({
+      message,
+      hasLocation,
+      locationSummary,
+      nearbyPlaces,
+    });
+  }
+
+  return generateFallbackResponse({ language, hasLocation });
+};
+
 const reverseGeocode = async ({ latitude, longitude }) => {
   const response = await axios.get("https://nominatim.openstreetmap.org/reverse", {
     params: {
@@ -215,11 +346,14 @@ out center 12;
   };
 };
 
-const buildPlacesFallbackResponse = ({ language, locationSummary, nearbyPlaces }) => {
+const buildPlacesFallbackResponse = ({ language, message, hasLocation, locationSummary, nearbyPlaces }) => {
   if (!nearbyPlaces?.places?.length) {
-    return generateFallbackResponse({
+    return generateSmartFallbackResponse({
       language,
-      hasLocation: Boolean(locationSummary),
+      message,
+      hasLocation,
+      locationSummary,
+      nearbyPlaces,
     });
   }
 
@@ -306,8 +440,9 @@ exports.sendMessage = async (req, res) => {
       });
     }
 
+    const requestedLanguage = language || session.language || "en";
     const selectedLanguage =
-      languageMap[language] || language || "English";
+      languageMap[requestedLanguage] || requestedLanguage || "English";
     const openRouterKey = process.env.OPENROUTER_API_KEY?.trim();
     const geminiKey = process.env.GEMINI_API_KEY?.trim();
 
@@ -422,7 +557,9 @@ Use this location to suggest:
         });
 
         aiResponse = buildPlacesFallbackResponse({
-          language,
+          language: requestedLanguage,
+          message,
+          hasLocation,
           locationSummary,
           nearbyPlaces,
         });
@@ -437,9 +574,11 @@ Use this location to suggest:
     }
 
     if (!aiResponse) {
-      aiResponse = generateFallbackResponse({
-        language,
+      aiResponse = generateSmartFallbackResponse({
+        language: requestedLanguage,
+        message,
         hasLocation,
+        locationSummary,
       });
       console.error("Chat provider fallback used:", providerErrors);
     }
