@@ -3,6 +3,24 @@ const ChatMessage = require("../models/ChatMessage");
 const axios = require("axios");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://lz4.overpass-api.de/api/interpreter",
+];
+const COHERE_CHAT_URL = "https://api.cohere.com/v2/chat";
+const COHERE_MODEL = "command-a-03-2025";
+const COHERE_TIMEOUT_MS = 30000;
+const COHERE_MAX_RETRIES = 2;
+const GEMINI_MODEL_CANDIDATES = [
+  "gemini-2.0-flash",
+  "gemini-1.5-flash-latest",
+  "gemini-1.5-flash",
+];
+
+let geminiCooldownUntil = 0;
+
 const getAuthenticatedUserId = (req) => req.user?.id || req.user?.userId || null;
 
 const languageMap = {
@@ -76,6 +94,12 @@ const detectLocationIntent = (message) => {
   };
 };
 
+const isNearbyPlacesRequest = (message) => {
+  const normalizedMessage = String(message || "").toLowerCase();
+
+  return /(near me|nearby|around me|around here|close by|close to me|current location|my location|things to do|places to visit|tourist spots?|restaurants?|hotels?|food|transport|station|airport)/.test(normalizedMessage);
+};
+
 const detectBudgetPreference = (message) => {
   const normalizedMessage = String(message || "").toLowerCase();
 
@@ -94,6 +118,81 @@ const detectBudgetPreference = (message) => {
   return "";
 };
 
+const destinationStopWords = new Set([
+  "a",
+  "an",
+  "area",
+  "attraction",
+  "attractions",
+  "beach",
+  "best",
+  "bus",
+  "cafe",
+  "city",
+  "dinner",
+  "destination",
+  "eat",
+  "evening",
+  "food",
+  "foods",
+  "guide",
+  "hotel",
+  "hotels",
+  "itinerary",
+  "lunch",
+  "metro",
+  "museum",
+  "park",
+  "places",
+  "plan",
+  "restaurant",
+  "restaurants",
+  "route",
+  "sightseeing",
+  "spot",
+  "spots",
+  "station",
+  "stay",
+  "tour",
+  "tourist",
+  "train",
+  "transport",
+  "travel",
+  "trip",
+  "visit",
+  "visiting",
+]);
+
+const normalizeCandidateDestination = (candidate) => {
+  const value = String(candidate || "")
+    .replace(/[.,!?;:]+$/g, "")
+    .trim();
+
+  if (!value) {
+    return "";
+  }
+
+  const tokens = value
+    .split(/\s+/)
+    .map((token) => token.replace(/[^A-Za-z.\-]/g, ""))
+    .filter(Boolean);
+
+  if (!tokens.length) {
+    return "";
+  }
+
+  const normalizedLower = tokens.join(" ").toLowerCase();
+  if (destinationStopWords.has(normalizedLower)) {
+    return "";
+  }
+
+  if (tokens.every((token) => destinationStopWords.has(token.toLowerCase()))) {
+    return "";
+  }
+
+  return tokens.join(" ");
+};
+
 const extractDestinationFromMessage = (message) => {
   const text = String(message || "").trim();
   if (!text) {
@@ -108,7 +207,10 @@ const extractDestinationFromMessage = (message) => {
   for (const pattern of patterns) {
     const match = text.match(pattern);
     if (match?.[1]) {
-      return match[1].trim();
+      const normalizedDestination = normalizeCandidateDestination(match[1]);
+      if (normalizedDestination) {
+        return normalizedDestination;
+      }
     }
   }
 
@@ -127,8 +229,8 @@ const buildEnglishSmartFallback = ({
   const areaText = destination || (hasLocation ? "your current area" : "your destination");
   const placeNames = nearbyPlaces?.places?.slice(0, 3).map((place) => place.name).filter(Boolean) || [];
   const intro = hasLocation
-    ? `I could not reach the AI provider, but I can still give you a practical travel answer for ${areaText}.`
-    : `I could not reach the AI provider, but here is a practical travel answer based on your message.`;
+    ? `Here is a practical travel answer for ${areaText}.`
+    : "Here is a practical travel answer based on your message.";
 
   if (intent.label === "hotels") {
     const budgetLine = budgetPreference
@@ -234,7 +336,7 @@ const buildGeminiPrompt = (systemPrompt, chatMessages) =>
 
 const generateOpenRouterResponse = async ({ apiKey, chatMessages, systemPrompt }) => {
   const response = await axios.post(
-    "https://openrouter.ai/api/v1/chat/completions",
+    OPENROUTER_URL,
     {
       model: "deepseek/deepseek-chat",
       messages: [
@@ -250,18 +352,90 @@ const generateOpenRouterResponse = async ({ apiKey, chatMessages, systemPrompt }
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:5000",
+        "X-Title": "multilingual-chatbot",
       },
+      timeout: 15000,
     }
   );
 
   return response?.data?.choices?.[0]?.message?.content?.trim();
 };
 
+const generateCohereResponse = async ({ apiKey, chatMessages, systemPrompt }) => {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= COHERE_MAX_RETRIES; attempt += 1) {
+    try {
+      const response = await axios.post(
+        COHERE_CHAT_URL,
+        {
+          model: COHERE_MODEL,
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...chatMessages.map((message) => ({
+              role: message.role,
+              content: message.content,
+            })),
+          ],
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            "X-Client-Name": "multilingual-chatbot",
+          },
+          timeout: COHERE_TIMEOUT_MS,
+        }
+      );
+
+      return response?.data?.message?.content
+        ?.filter((item) => item?.type === "text")
+        .map((item) => item.text)
+        .join("\n")
+        .trim();
+    } catch (error) {
+      lastError = error;
+      const status = error.response?.status;
+      const isRetryable =
+        error.code === "ECONNABORTED" ||
+        status === 408 ||
+        status === 429 ||
+        status === 500 ||
+        status === 502 ||
+        status === 503 ||
+        status === 504;
+
+      if (!isRetryable || attempt === COHERE_MAX_RETRIES) {
+        throw error;
+      }
+
+      await wait(800 * (attempt + 1));
+    }
+  }
+
+  throw lastError || new Error("Cohere request failed.");
+};
+
 const generateGeminiResponse = async ({ apiKey, chatMessages, systemPrompt }) => {
   const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-  const result = await model.generateContent(buildGeminiPrompt(systemPrompt, chatMessages));
-  return result.response.text().trim();
+  let lastError = null;
+
+  for (const modelName of GEMINI_MODEL_CANDIDATES) {
+    try {
+      const model = genAI.getGenerativeModel({ model: modelName });
+      const result = await model.generateContent(buildGeminiPrompt(systemPrompt, chatMessages));
+      return result.response.text().trim();
+    } catch (error) {
+      lastError = error;
+
+      if (error.response?.status !== 404 && !String(error.message || "").includes("404")) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error("No supported Gemini model was available for generateContent.");
 };
 
 const generateFallbackResponse = ({ language, hasLocation }) => {
@@ -288,6 +462,26 @@ const generateSmartFallbackResponse = ({
   return generateFallbackResponse({ language, hasLocation });
 };
 
+const parseRetryDelayMs = (text) => {
+  const value = String(text || "");
+  const retrySecondsMatch = value.match(/retry in\s+(\d+(?:\.\d+)?)s/i);
+  if (retrySecondsMatch?.[1]) {
+    return Math.ceil(Number(retrySecondsMatch[1]) * 1000);
+  }
+
+  const retryDelayMatch = value.match(/"retryDelay":"(\d+)s"/i);
+  if (retryDelayMatch?.[1]) {
+    return Number(retryDelayMatch[1]) * 1000;
+  }
+
+  return 0;
+};
+
+const isGeminiQuotaError = (error) => {
+  const text = String(error.response?.data || error.message || "").toLowerCase();
+  return error.response?.status === 429 || text.includes("quota exceeded") || text.includes("too many requests");
+};
+
 const reverseGeocode = async ({ latitude, longitude }) => {
   const response = await axios.get("https://nominatim.openstreetmap.org/reverse", {
     params: {
@@ -306,44 +500,118 @@ const reverseGeocode = async ({ latitude, longitude }) => {
   return response.data;
 };
 
+const wait = (ms) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+const isOverpassRetryableError = (error) => {
+  const status = error.response?.status;
+  const body = String(error.response?.data || error.message || "").toLowerCase();
+
+  return (
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    body.includes("too busy") ||
+    body.includes("timeout")
+  );
+};
+
+const summarizeProviderError = (error) => {
+  if (isGeminiQuotaError(error)) {
+    const retryAfterMs = parseRetryDelayMs(error.response?.data || error.message);
+    const retryAfterText = retryAfterMs ? ` Retry after about ${Math.ceil(retryAfterMs / 1000)}s.` : "";
+    return `Gemini quota exceeded.${retryAfterText}`;
+  }
+
+  const rawData = error.response?.data;
+
+  if (typeof rawData === "string") {
+    return rawData
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 220);
+  }
+
+  if (rawData?.error?.message) {
+    return rawData.error.message;
+  }
+
+  if (rawData?.message) {
+    return rawData.message;
+  }
+
+  return String(error.message || "Unknown error");
+};
+
+const buildProviderErrorEntry = (provider, error) => ({
+  provider,
+  status: error.response?.status || 500,
+  error: summarizeProviderError(error),
+});
+
+const logProviderFallbackErrors = (providerErrors) => {
+  if (!providerErrors.length) {
+    return;
+  }
+
+  console.error("Chat provider fallback used:", providerErrors);
+};
+
 const fetchNearbyPlaces = async ({ latitude, longitude, message }) => {
   const intent = detectLocationIntent(message);
-  const radius = 5000;
+  const radius = 3500;
   const query = `
 [out:json][timeout:20];
 (
   ${intent.tags.map((tag) => `${tag}(around:${radius},${latitude},${longitude});`).join("\n  ")}
 );
-out center 12;
+out center 8;
 `;
 
-  const response = await axios.post(
-    "https://overpass-api.de/api/interpreter",
-    query,
-    {
-      headers: {
-        "Content-Type": "text/plain",
-        "User-Agent": "multilingual-chatbot/1.0",
-      },
-      timeout: 12000,
-    }
-  );
+  for (let index = 0; index < OVERPASS_ENDPOINTS.length; index += 1) {
+    try {
+      const response = await axios.post(
+        OVERPASS_ENDPOINTS[index],
+        query,
+        {
+          headers: {
+            "Content-Type": "text/plain",
+            "User-Agent": "multilingual-chatbot/1.0",
+          },
+          timeout: 12000,
+        }
+      );
 
-  const elements = Array.isArray(response.data?.elements) ? response.data.elements : [];
-  return {
-    intent,
-    places: elements
-      .map((element) => {
-        const tags = element.tags || {};
-        return {
-          name: tags.name,
-          type: tags.tourism || tags.amenity || tags.leisure || tags.historic || tags.railway || tags.public_transport,
-          address: [tags["addr:street"], tags["addr:city"]].filter(Boolean).join(", "),
-        };
-      })
-      .filter((place) => place.name)
-      .slice(0, 5),
-  };
+      const elements = Array.isArray(response.data?.elements) ? response.data.elements : [];
+      return {
+        intent,
+        places: elements
+          .map((element) => {
+            const tags = element.tags || {};
+            return {
+              name: tags.name,
+              type: tags.tourism || tags.amenity || tags.leisure || tags.historic || tags.railway || tags.public_transport,
+              address: [tags["addr:street"], tags["addr:city"]].filter(Boolean).join(", "),
+            };
+          })
+          .filter((place) => place.name)
+          .slice(0, 5),
+      };
+    } catch (error) {
+      if (!isOverpassRetryableError(error) || index === OVERPASS_ENDPOINTS.length - 1) {
+        throw error;
+      }
+
+      await wait(400 * (index + 1));
+    }
+  }
+
+  return { intent, places: [] };
 };
 
 const buildPlacesFallbackResponse = ({ language, message, hasLocation, locationSummary, nearbyPlaces }) => {
@@ -443,8 +711,7 @@ exports.sendMessage = async (req, res) => {
     const requestedLanguage = language || session.language || "en";
     const selectedLanguage =
       languageMap[requestedLanguage] || requestedLanguage || "English";
-    const openRouterKey = process.env.OPENROUTER_API_KEY?.trim();
-    const geminiKey = process.env.GEMINI_API_KEY?.trim();
+    const cohereKey = process.env.COHERE_API_KEY?.trim() || "";
 
     // =============================
     // 1️⃣ Save User Message
@@ -460,7 +727,7 @@ exports.sendMessage = async (req, res) => {
     // =============================
     const previousMessages = await ChatMessage.find({ sessionId: session._id })
       .sort({ createdAt: 1 })
-      .limit(20);
+      .limit(12);
 
     const chatMessages = previousMessages.map((msg) => ({
       role: msg.sender === "user" ? "user" : "assistant",
@@ -513,42 +780,24 @@ Use this location to suggest:
     let aiResponse = "";
     let provider = "fallback";
     const providerErrors = [];
+    const shouldTryNearbyPlaces = hasLocation && isNearbyPlacesRequest(message);
 
-    if (openRouterKey) {
+    if (cohereKey) {
       try {
-        aiResponse = await generateOpenRouterResponse({
-          apiKey: openRouterKey,
+        aiResponse = await generateCohereResponse({
+          apiKey: cohereKey,
           chatMessages,
           systemPrompt,
         });
-        provider = "openrouter";
+        provider = "cohere";
       } catch (error) {
-        providerErrors.push({
-          provider: "openrouter",
-          status: error.response?.status || 500,
-          error: error.response?.data || error.message,
-        });
+        providerErrors.push(buildProviderErrorEntry("cohere", error));
       }
+    } else {
+      console.error("Cohere API key missing. Add COHERE_API_KEY to .env.");
     }
 
-    if (!aiResponse && geminiKey) {
-      try {
-        aiResponse = await generateGeminiResponse({
-          apiKey: geminiKey,
-          chatMessages,
-          systemPrompt,
-        });
-        provider = "gemini";
-      } catch (error) {
-        providerErrors.push({
-          provider: "gemini",
-          status: error.response?.status || 500,
-          error: error.response?.data || error.message,
-        });
-      }
-    }
-
-    if (!aiResponse && hasLocation) {
+    if (!aiResponse && shouldTryNearbyPlaces) {
       try {
         const nearbyPlaces = await fetchNearbyPlaces({
           latitude: parsedLatitude,
@@ -565,11 +814,7 @@ Use this location to suggest:
         });
         provider = "osm-fallback";
       } catch (error) {
-        providerErrors.push({
-          provider: "overpass",
-          status: error.response?.status || 500,
-          error: error.response?.data || error.message,
-        });
+        providerErrors.push(buildProviderErrorEntry("overpass", error));
       }
     }
 
@@ -580,7 +825,7 @@ Use this location to suggest:
         hasLocation,
         locationSummary,
       });
-      console.error("Chat provider fallback used:", providerErrors);
+      logProviderFallbackErrors(providerErrors);
     }
 
     // =============================
