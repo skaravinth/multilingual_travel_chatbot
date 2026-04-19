@@ -41,6 +41,41 @@ const buildLocationSummary = (locationData) => {
   return parts.join(", ");
 };
 
+const detectLocationIntent = (message) => {
+  const normalizedMessage = String(message || "").toLowerCase();
+
+  if (/(hotel|stay|resort|room|lodg)/.test(normalizedMessage)) {
+    return {
+      label: "hotels",
+      tags: ['node["tourism"="hotel"]', 'node["tourism"="guest_house"]', 'node["tourism"="hostel"]'],
+    };
+  }
+
+  if (/(food|restaurant|eat|cafe|coffee|dinner|lunch|breakfast)/.test(normalizedMessage)) {
+    return {
+      label: "food spots",
+      tags: ['node["amenity"="restaurant"]', 'node["amenity"="cafe"]', 'node["amenity"="fast_food"]'],
+    };
+  }
+
+  if (/(bus|train|metro|transport|station|airport|travel)/.test(normalizedMessage)) {
+    return {
+      label: "transport options",
+      tags: ['node["public_transport"]', 'node["railway"="station"]', 'node["amenity"="bus_station"]'],
+    };
+  }
+
+  return {
+    label: "tourist spots",
+    tags: [
+      'node["tourism"="attraction"]',
+      'node["historic"]',
+      'node["leisure"="park"]',
+      'node["tourism"="museum"]',
+    ],
+  };
+};
+
 const fallbackMessages = {
   en: ({ hasLocation }) =>
     `I can still help with travel planning right now. Share your destination, budget, travel dates, and interests, and I will suggest places to visit, food to try, transport options, and hotel ideas.${hasLocation ? " I noticed location data was shared, so I can tailor nearby travel ideas once you tell me what kind of trip you want." : ""}`,
@@ -138,6 +173,66 @@ const reverseGeocode = async ({ latitude, longitude }) => {
   });
 
   return response.data;
+};
+
+const fetchNearbyPlaces = async ({ latitude, longitude, message }) => {
+  const intent = detectLocationIntent(message);
+  const radius = 5000;
+  const query = `
+[out:json][timeout:20];
+(
+  ${intent.tags.map((tag) => `${tag}(around:${radius},${latitude},${longitude});`).join("\n  ")}
+);
+out center 12;
+`;
+
+  const response = await axios.post(
+    "https://overpass-api.de/api/interpreter",
+    query,
+    {
+      headers: {
+        "Content-Type": "text/plain",
+        "User-Agent": "multilingual-chatbot/1.0",
+      },
+      timeout: 12000,
+    }
+  );
+
+  const elements = Array.isArray(response.data?.elements) ? response.data.elements : [];
+  return {
+    intent,
+    places: elements
+      .map((element) => {
+        const tags = element.tags || {};
+        return {
+          name: tags.name,
+          type: tags.tourism || tags.amenity || tags.leisure || tags.historic || tags.railway || tags.public_transport,
+          address: [tags["addr:street"], tags["addr:city"]].filter(Boolean).join(", "),
+        };
+      })
+      .filter((place) => place.name)
+      .slice(0, 5),
+  };
+};
+
+const buildPlacesFallbackResponse = ({ language, locationSummary, nearbyPlaces }) => {
+  if (!nearbyPlaces?.places?.length) {
+    return generateFallbackResponse({
+      language,
+      hasLocation: Boolean(locationSummary),
+    });
+  }
+
+  const heading = locationSummary
+    ? `Here are some ${nearbyPlaces.intent.label} near ${locationSummary}:`
+    : `Here are some nearby ${nearbyPlaces.intent.label}:`;
+
+  const lines = nearbyPlaces.places.map((place, index) => {
+    const details = [place.type, place.address].filter(Boolean).join(" - ");
+    return `${index + 1}. ${place.name}${details ? ` (${details})` : ""}`;
+  });
+
+  return `${heading}\n${lines.join("\n")}\nTell me if you want the best option, family-friendly places, budget picks, or a one-day plan nearby.`;
 };
 /* =========================
    CREATE SESSION
@@ -312,6 +407,29 @@ Use this location to suggest:
       } catch (error) {
         providerErrors.push({
           provider: "gemini",
+          status: error.response?.status || 500,
+          error: error.response?.data || error.message,
+        });
+      }
+    }
+
+    if (!aiResponse && hasLocation) {
+      try {
+        const nearbyPlaces = await fetchNearbyPlaces({
+          latitude: parsedLatitude,
+          longitude: parsedLongitude,
+          message,
+        });
+
+        aiResponse = buildPlacesFallbackResponse({
+          language,
+          locationSummary,
+          nearbyPlaces,
+        });
+        provider = "osm-fallback";
+      } catch (error) {
+        providerErrors.push({
+          provider: "overpass",
           status: error.response?.status || 500,
           error: error.response?.data || error.message,
         });
